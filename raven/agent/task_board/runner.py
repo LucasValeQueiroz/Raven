@@ -35,6 +35,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 from loguru import logger
@@ -62,6 +63,7 @@ from raven.i18n import prompt
 MAX_ATTEMPTS = 3
 OPEN_STEPS_SHOWN = 2
 ASKED_SHOWN = 8
+RECENT_COMPLETED_SHOWN = 5
 TEMPLATE = "task_board_update"
 MATTERS_TEMPLATE = "task_board_matters"
 MATTERS_OWNERS_TEMPLATE = "task_board_matters_owners"
@@ -92,16 +94,42 @@ def should_run(status: str, dispatches: Sequence[Dispatch], *, silent: bool = Fa
     return status == "completed" and (bool(dispatches) or not silent)
 
 
+def _time_text(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _group_line(group: TaskGroup) -> str:
+    line = f"- {group.id} [{group.status}] {group.title}"
+    if group.summary:
+        line += f" -- {group.summary}"
+    return line + f" (created {_time_text(group.created_at)}, updated {_time_text(group.updated_at)})"
+
+
+def _step_lines(group: TaskGroup) -> list[str]:
+    return [f"    - {step.title}" for step in group.steps[-OPEN_STEPS_SHOWN:]]
+
+
 def _snapshot(board: Board) -> str:
     if not board.groups:
         return "(the board is empty)"
+    completed = sorted((g for g in board.groups if g.status == "completed"), key=lambda g: g.updated_at, reverse=True)
+    recent, earlier = completed[:RECENT_COMPLETED_SHOWN], completed[RECENT_COMPLETED_SHOWN:]
     lines: list[str] = []
     for group in sorted((g for g in board.groups if g.status != "completed"), key=lambda g: g.created_at):
-        lines.append(f"- {group.id} [{group.status}] {group.title}" + (f" -- {group.summary}" if group.summary else ""))
-        lines.extend(f"    - {step.title}" for step in group.steps[-OPEN_STEPS_SHOWN:])
-    done = sorted((g for g in board.groups if g.status == "completed"), key=lambda g: g.created_at)
-    if done:
-        lines.append("Completed: " + "; ".join(f"{g.id}: {g.title}" for g in done))
+        lines.append(_group_line(group))
+        lines.extend(_step_lines(group))
+    for group in recent:
+        lines.append(_group_line(group))
+        lines.extend(_step_lines(group))
+    if earlier:
+        lines.append(
+            "Completed: "
+            + "; ".join(
+                f"{group.id}: {group.title}"
+                f" (created {_time_text(group.created_at)}, updated {_time_text(group.updated_at)})"
+                for group in sorted(earlier, key=lambda g: g.created_at)
+            )
+        )
     return "\n".join(lines)
 
 
@@ -396,15 +424,18 @@ def build_instruction(
     *,
     owners: Collection[str] = (),
     asked: Sequence[str] = (),
+    now: str = "",
 ) -> str:
     """The post-turn instruction: the board record, the handles to place, the paragraph that
     lists the turn's ``candidates`` -- ``owners`` among them named first, on a line of their
     own -- and the questions the reply asked."""
+    now_line = f"Current time: {now}.\n\n" if now else ""
     return prompt(TEMPLATE).format(
         board=_snapshot(board),
         dispatches=_handles(board, dispatches),
         matters=_matters_paragraph(candidates, owners),
         asked=_asked_block(asked),
+        now_line=now_line,
     )
 
 
@@ -586,7 +617,14 @@ async def _ask(
     last update sent is salvaged: its work is placed and its steps written unless a fault
     lies there -- a fault in ``matters`` alone never stops it.
     """
-    instruction = build_instruction(board, dispatches, candidates, owners=owners, asked=questions)
+    instruction = build_instruction(
+        board,
+        dispatches,
+        candidates,
+        owners=owners,
+        asked=questions,
+        now=_time_text(now_ms()),
+    )
     known = {group.id for group in board.groups}
     rows = list(window) + [{"role": "user", "content": instruction}]
     last: dict[str, Any] | None = None

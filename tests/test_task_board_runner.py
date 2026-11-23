@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -27,6 +28,7 @@ from raven.agent.task_board.board import (
 from raven.agent.task_board.runner import (
     MAX_ATTEMPTS,
     OPEN_STEPS_SHOWN,
+    _ask,
     asked,
     build_instruction,
     run_post_turn,
@@ -412,6 +414,155 @@ def test_the_instruction_stays_bounded_on_a_long_session():
     assert "g_0 [idle] Matter 0 -- Where matter 0 stands" in text
     assert "detail 0." not in text, "a step's summary is for recall; the record carries titles"
     assert "g_1: Matter 1" in text and "group 1 step" not in text and "Where matter 1 stands" not in text
+
+
+BASE = 1_700_000_000_000
+
+
+def _iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _record_of(text: str) -> str:
+    return text[text.index("[BEGIN BOARD RECORD]") : text.index("[END BOARD RECORD]")]
+
+
+def test_the_five_most_recently_updated_completed_groups_are_expanded():
+    groups = [
+        TaskGroup(
+            f"g_{i}",
+            f"Matter {i}",
+            f"Summary {i}",
+            "completed",
+            BASE + i * 1000,
+            BASE + (100 - i * 10) * 1000,
+            [ProgressStep(f"s{i}", "T0", None, f"Step {i}", "detail", [])],
+        )
+        for i in range(1, 7)
+    ]
+
+    record = _record_of(build_instruction(Board(groups, []), []))
+
+    for i in range(1, 6):
+        assert f"- g_{i} [completed] Matter {i} -- Summary {i}" in record
+        assert f"    - Step {i}" in record
+        assert f"(created {_iso(BASE + i * 1000)}, updated {_iso(BASE + (100 - i * 10) * 1000)})" in record
+    assert "g_6: Matter 6" in record
+    assert "Summary 6" not in record
+    assert "Step 6" not in record
+    assert f"(created {_iso(BASE + 6000)}, updated {_iso(BASE + 40_000)})" in record
+
+
+def test_every_group_shows_its_created_and_updated_times():
+    idle = TaskGroup(
+        "g_active",
+        "Active matter",
+        "Active summary",
+        "idle",
+        BASE,
+        BASE + 1000,
+        [ProgressStep("s_active", "T0", None, "Active step", "detail", [])],
+    )
+    completed = [
+        TaskGroup(
+            f"g_c{i}",
+            f"Completed {i}",
+            f"Completed summary {i}",
+            "completed",
+            BASE + i * 1000,
+            BASE + (10 + i) * 1000,
+            [ProgressStep(f"s_c{i}", "T0", None, f"Completed step {i}", "detail", [])],
+        )
+        for i in range(1, 7)
+    ]
+
+    record = _record_of(build_instruction(Board([idle, *completed], []), []))
+
+    assert (
+        f"- g_active [idle] Active matter -- Active summary (created {_iso(BASE)}, updated {_iso(BASE + 1000)})"
+        in record
+    )
+    for i in range(1, 7):
+        assert f"created {_iso(BASE + i * 1000)}" in record
+        assert f"updated {_iso(BASE + (10 + i) * 1000)}" in record
+
+
+def test_a_completed_group_with_no_summary_keeps_its_times():
+    group = TaskGroup(
+        "g_empty",
+        "No summary",
+        "",
+        "completed",
+        BASE,
+        BASE + 1000,
+        [ProgressStep("s_empty", "T0", None, "Only step", "detail", [])],
+    )
+
+    record = _record_of(build_instruction(Board([group], []), []))
+
+    assert f"- g_empty [completed] No summary (created {_iso(BASE)}, updated {_iso(BASE + 1000)})" in record
+    assert "No summary --" not in record
+
+
+def test_five_or_fewer_completed_groups_have_no_compressed_line():
+    for count in (0, 1, 5):
+        groups = [
+            TaskGroup(
+                f"g_{i}",
+                f"Matter {i}",
+                f"Summary {i}",
+                "completed",
+                BASE + i * 1000,
+                BASE + i * 1000,
+                [ProgressStep(f"s{i}", "T0", None, f"Step {i}", "detail", [])],
+            )
+            for i in range(count)
+        ]
+
+        record = _record_of(build_instruction(Board(groups, []), []))
+
+        assert "Completed:" not in record
+
+
+def test_the_instruction_carries_the_current_time_when_given():
+    text = build_instruction(Board([], []), [], now="2026-11-20T13:10:00Z")
+
+    assert "Current time: 2026-11-20T13:10:00Z." in text
+
+
+def test_the_instruction_omits_the_current_time_when_not_given():
+    assert "Current time:" not in build_instruction(Board([], []), [])
+
+
+def test_the_instruction_describes_the_recent_completed_groups():
+    text = build_instruction(Board([], []), [])
+
+    assert "five most recently updated completed groups" in text
+
+
+async def test_the_update_instruction_carries_the_update_time():
+    instructions: list[str] = []
+
+    async def call(rows):
+        instructions.append(rows[-1]["content"])
+        return GOOD
+
+    await _ask(
+        Board([], []),
+        session_key=KEY,
+        call=call,
+        window=[],
+        dispatches=[SPAWN],
+        turn_at="T0",
+        turn_id=None,
+        now_ms=lambda: 1_000,
+        owners=[],
+        candidates=[],
+        words="",
+        questions=[],
+    )
+
+    assert "Current time: 1970-01-01T00:00:01Z." in instructions[0]
 
 
 def test_unassigned_handles_are_listed_before_the_turns_own():
